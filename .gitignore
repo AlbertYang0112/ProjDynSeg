@@ -1,0 +1,8 @@
+# Virtualenv
+env/
+
+# VSCode Configuration
+.vscode/
+
+# Dataset
+datasets/
