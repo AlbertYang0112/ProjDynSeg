@@ -2,17 +2,19 @@ import torch as th
 from math import ceil
 from torch import nn
 from torch.nn.functional import pad, fold, unfold
-from detectron2.modeling.backbone.resnet import build_resnet_backbone
+from detectron2.modeling.backbone.resnet import build_resnet_backbone, BottleneckBlock
 from detectron2.modeling.backbone.build import BACKBONE_REGISTRY
 from detectron2.layers import ShapeSpec
+import pdb
 
 
 class DynamicBlock(nn.Module):
-    def __init__(self, in_channels, shared_block, extra_block,
+    def __init__(self, in_channels, shared_block, extra_block, stride,
                  region_cnt_w, region_cnt_h) -> None:
         super().__init__()
         self.shared_block = shared_block
         self.extra_block = extra_block
+        self.stride = stride
         self.switch_module = nn.Sequential(
             nn.AdaptiveMaxPool2d(output_size=(region_cnt_h, region_cnt_w)),
             nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, groups=in_channels),
@@ -25,6 +27,7 @@ class DynamicBlock(nn.Module):
             nn.Tanh(),
             nn.ReLU6(inplace=True),
         )
+        self.stride_layer = nn.MaxPool2d(kernel_size=3, stride=self.stride, padding=1)
         self.region_cnt_w = region_cnt_w
         self.region_cnt_h = region_cnt_h
 
@@ -45,7 +48,7 @@ class DynamicBlock(nn.Module):
         h, w = x.shape[-2:]
         pad_h = ceil(h / self.region_cnt_h) * self.region_cnt_h - h
         pad_w = ceil(w / self.region_cnt_w) * self.region_cnt_w - w
-        pad_factor = (pad_h // 2, pad_h - (pad_h // 2), pad_w, pad_w - (pad_w // 2))
+        pad_factor = (pad_h // 2, pad_h - (pad_h // 2), pad_w // 2, pad_w - (pad_w // 2))
         x_pad = pad(x, pad_factor, mode='replicate')
         return x_pad, pad_factor
 
@@ -65,15 +68,64 @@ class DynamicBlock(nn.Module):
         patch_feat = patch_feat.transpose(-1, -2)
         patch_feat = fold(patch_feat, output_size=pad_shape,
                           kernel_size=region_shape, stride=region_shape)
+        if self.stride != 1:
+            patch_feat = self.stride_layer(patch_feat)
         patch_channel = patch_feat.shape[1]
         switch = self.switch_module(x_pad)
-        switch = th.cat([switch] * patch_channel * region_shape[0] * region_shape[1], 
-                        dim=1).reshape(
-                            batch_size, -1, self.region_cnt_w * self.region_cnt_h)
-        print(switch.shape)
-        switch = fold(switch, output_size=pad_shape, 
-                      kernel_size=region_shape, stride=region_shape)
-        print(patch_channel, switch.shape, patch_feat.shape, shared_feat.shape)
-        out_feat = (1 - switch) * shared_feat + switch * patch_feat
+        switch_expand = th.cat([switch] * patch_channel * region_shape[0] * region_shape[1],
+                               dim=1).reshape(
+                               batch_size, -1, self.region_cnt_w * self.region_cnt_h)
+        switch_expand = fold(switch_expand, output_size=pad_shape, 
+                             kernel_size=region_shape, stride=region_shape)
+        if self.stride != 1:
+            switch_expand = self.stride_layer(switch_expand)
+        print(switch_expand.shape, shared_feat.shape, patch_feat.shape)
+        out_feat = (1 - switch_expand) * shared_feat + switch_expand * patch_feat
         out_feat = self.region_stripping(out_feat, pad_factor)
-        return out_feat
+        return out_feat, switch
+
+
+class DynamicResNet(nn.Module):
+    def __init__(self, resnet) -> None:
+        super().__init__()
+        self.stem = resnet.stem
+        for i in range(2, 5):
+            res_layer = getattr(resnet, f'res{i}')
+            in_channels = res_layer[0].in_channels
+            out_channels = res_layer[0].out_channels
+            stride = res_layer[0].stride
+            bottleneck_channels = in_channels
+            extra_layer = BottleneckBlock(in_channels=in_channels,
+                                          out_channels=out_channels,
+                                          bottleneck_channels=bottleneck_channels)
+            dynamic_layer = DynamicBlock(in_channels=in_channels,
+                                         shared_block=res_layer, extra_block=extra_layer,
+                                         stride=stride,
+                                         region_cnt_w=8, region_cnt_h=8)
+            setattr(self, f"dynamic_layer{i}", dynamic_layer)
+
+    def forward(self, x):
+        x = self.stem(x)
+        outputs = {}
+        for i in range(2, 5):
+            layer = getattr(self, f"dynamic_layer{i}")
+            print(f"Layer {i}")
+            x, sw = layer(x)
+            outputs[f'res{i}'] = x
+            outputs[f'sw{i}'] = sw
+        return outputs
+
+
+@BACKBONE_REGISTRY.register()
+def build_dynamic_resnet_backbone(cfg, input_shape: ShapeSpec):
+    """
+    Args:
+        cfg: a detectron2 CfgNode
+
+    Returns:
+        backbone (Backbone): backbone module, must
+        be a subclass of :class:`Backbone`.
+    """
+    resnet = build_resnet_backbone(cfg, input_shape)
+    backbone = DynamicResNet(resnet)
+    return backbone
